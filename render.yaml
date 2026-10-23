@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: attendance-biometric-service
+    runtime: docker
+    plan: standard
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /healthz
+    autoDeployTrigger: off
+    disk:
+      name: biometric-data
+      mountPath: /data
+      sizeGB: 5
+    envVars:
+      - key: BIOMETRIC_API_KEY
+        sync: false
+      - key: BIOMETRIC_DATA_DIR
+        value: /data
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: OPENBIOMETRICS_API_PATH
+        value: /opt/openbiometrics/api

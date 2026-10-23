@@ -1,0 +1,36 @@
+name: Biometric service CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  adapter-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m compileall -q biometric_service tests
+      - run: pytest -q
+      - name: Validate Render blueprint and Docker configuration
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          dockerfile = Path("Dockerfile").read_text()
+          render = Path("render.yaml").read_text()
+          assert "ab09d469327684d630b7383119dd4544253a03c9" in dockerfile
+          assert "healthCheckPath: /healthz" in render
+          assert "mountPath: /data" in render
+          assert "sync: false" in render
+          print("PASS: pinned engine, Render health check, persistent disk and secret input")
+          PY
+
+      - name: Build container with pinned upstream and models
+        run: docker build --tag attendance-biometric-service:ci .
