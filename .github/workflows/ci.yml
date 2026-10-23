@@ -18,7 +18,7 @@ jobs:
           cache: pip
       - run: pip install -r requirements-dev.txt
       - run: python -m compileall -q biometric_service tests
-      - run: pytest -q
+      - run: python -m pytest -q
       - name: Validate Render blueprint and Docker configuration
         run: |
           python - <<'PY'
