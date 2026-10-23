@@ -16,6 +16,42 @@ RUN git init . \
     && git remote add origin https://github.com/openbm/openbiometrics.git \
     && git fetch --depth 1 origin ab09d469327684d630b7383119dd4544253a03c9 \
     && git checkout --detach FETCH_HEAD
+# Fix upstream dynamic-version paths rejected by modern setuptools.
+RUN python - <<'PY'
+from pathlib import Path
+
+root = Path("/opt/openbiometrics")
+version = (root / "VERSION").read_text(encoding="utf-8").strip()
+
+if not version:
+    raise SystemExit("Pinned OpenBiometrics VERSION file is empty")
+
+for package in ("engine", "api"):
+    package_dir = root / package
+    pyproject = package_dir / "pyproject.toml"
+
+    if not pyproject.is_file():
+        raise SystemExit(f"Missing upstream packaging metadata: {pyproject}")
+
+    source = pyproject.read_text(encoding="utf-8")
+    old_reference = 'version = {file = "../VERSION"}'
+    new_reference = 'version = {file = "VERSION"}'
+
+    if source.count(old_reference) != 1:
+        raise SystemExit(
+            f"Expected exactly one parent-relative version reference in {pyproject}"
+        )
+
+    (package_dir / "VERSION").write_text(
+        version + "\n", encoding="utf-8"
+    )
+    pyproject.write_text(
+        source.replace(old_reference, new_reference, 1),
+        encoding="utf-8",
+    )
+
+print(f"Patched pinned upstream package metadata to version {version}.")
+PY
 
 COPY patch_openbiometrics.py /opt/openbiometrics/patch_openbiometrics.py
 COPY scripts/prepare_models.py /opt/openbiometrics/prepare_models.py
