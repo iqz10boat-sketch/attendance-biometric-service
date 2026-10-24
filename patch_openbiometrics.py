@@ -180,4 +180,71 @@ replace_exactly_once(
         )"""
     },
 )
-print("Applied CPU-only API configuration and the pinned public MiniFASNet preprocessing/output adapter.")
+
+
+# The community SFace recognizer emits 128-dimensional embeddings, while the
+# pinned upstream watchlist defaults to 512-dimensional ArcFace embeddings.
+# Size an empty FAISS index from the actual vector, guard mismatches before
+# FAISS asserts, and preserve non-empty indexes if they use another dimension.
+watchlist_path = engine_package / "watchlist" / "store.py"
+replace_exactly_once(
+    watchlist_path,
+    {
+        "    EMBEDDING_DIM = 512": "    EMBEDDING_DIM = 128",
+        """        embedding = embedding.reshape(1, -1).astype(np.float32)
+        with self._lock:
+            self._index.add(embedding)
+            self._identities.append(
+""": """        embedding = embedding.reshape(1, -1).astype(np.float32)
+        if embedding.shape[1] < 1:
+            raise ValueError("Face embedding must not be empty")
+        with self._lock:
+            if embedding.shape[1] != self._index.d:
+                if self._index.ntotal == 0:
+                    # An empty index has no templates to lose; use the model's
+                    # actual output dimension before inserting the first vector.
+                    self._index = faiss.IndexFlatIP(int(embedding.shape[1]))
+                else:
+                    raise ValueError(
+                        f"Face embedding dimension mismatch: index expects {self._index.d}, "
+                        f"received {embedding.shape[1]}; existing templates were preserved"
+                    )
+            self._index.add(embedding)
+            self._identities.append(
+""",
+        """        embedding = embedding.reshape(1, -1).astype(np.float32)
+        k = min(top_k, self.size)
+""": """        embedding = embedding.reshape(1, -1).astype(np.float32)
+        if embedding.shape[1] != self._index.d:
+            raise ValueError(
+                f"Face query dimension mismatch: index expects {self._index.d}, "
+                f"received {embedding.shape[1]}"
+            )
+        k = min(top_k, self.size)
+""",
+        """            all_vectors = faiss.rev_swig_ptr(
+                self._index.get_xb(), self.size * self.EMBEDDING_DIM
+            ).reshape(-1, self.EMBEDDING_DIM).copy()
+""": """            index_dimension = self._index.d
+            all_vectors = faiss.rev_swig_ptr(
+                self._index.get_xb(), self.size * index_dimension
+            ).reshape(-1, index_dimension).copy()
+""",
+        """            self._index = faiss.read_index(str(index_path))
+            with open(meta_path) as f:
+                self._identities = json.load(f)
+""": """            loaded_index = faiss.read_index(str(index_path))
+            with open(meta_path) as f:
+                loaded_identities = json.load(f)
+            if not isinstance(loaded_identities, list) or loaded_index.ntotal != len(loaded_identities):
+                raise ValueError(
+                    "Persisted watchlist index and identity metadata are inconsistent; "
+                    "refusing to overwrite biometric templates"
+                )
+            self._index = loaded_index
+            self._identities = loaded_identities
+""",
+    },
+)
+
+print("Applied CPU-only API configuration, pinned MiniFASNet preprocessing, and recognizer-compatible FAISS watchlists.")
