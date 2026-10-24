@@ -24,6 +24,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Upload
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+from .liveness_challenges import initialize_liveness_tables, router as liveness_challenge_router
 
 SERVICE_VERSION = "0.1.0"
 DEFAULT_DATA_DIR = Path(os.getenv("BIOMETRIC_DATA_DIR", str(Path.cwd() / ".data")))
@@ -172,7 +173,9 @@ async def lifespan(app: FastAPI):
         app.state.engine_status = engine_status
         app.state.data_dir = data_dir
         app.state.registry = _init_registry(data_dir / "registry.sqlite3")
+        initialize_liveness_tables(app.state.registry)
         app.state.engine_lock = asyncio.Lock()
+        app.state.liveness_lock = asyncio.Lock()
         app.state.engine_client = client
         app.state.started_at = time.monotonic()
         if not all(engine_status.values()):
@@ -199,6 +202,12 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
     lifespan=lifespan,
+)
+
+app.include_router(
+    liveness_challenge_router,
+    prefix="/v1/liveness",
+    dependencies=[Depends(require_api_key)],
 )
 
 

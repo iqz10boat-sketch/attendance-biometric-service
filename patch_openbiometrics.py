@@ -149,4 +149,35 @@ replace_exactly_once(
     },
 )
 
+
+# The pinned upstream kernel references model-selection fields which its
+# PipelineConfig dataclass omitted. Add the fields and pass configured values.
+pipeline_config_path = engine_package / "core" / "pipeline.py"
+replace_exactly_once(
+    pipeline_config_path,
+    {
+        """    quality_gate: bool = False  # Skip recognition if quality fails
+""": """    quality_gate: bool = False  # Skip recognition if quality fails
+
+    detector: str = "auto"
+    recognizer: str = "auto"
+    demographics_model: str = "auto"
+"""
+    },
+)
+
+kernel_path = engine_package / "kernel.py"
+replace_exactly_once(
+    kernel_path,
+    {
+        """            enable_quality=face_cfg.enable_quality,
+            quality_gate=face_cfg.quality_gate,
+        )""": """            enable_quality=face_cfg.enable_quality,
+            quality_gate=face_cfg.quality_gate,
+            detector=face_cfg.detector,
+            recognizer=face_cfg.recognizer,
+            demographics_model=face_cfg.demographics_model,
+        )"""
+    },
+)
 print("Applied CPU-only API configuration and the pinned public MiniFASNet preprocessing/output adapter.")
