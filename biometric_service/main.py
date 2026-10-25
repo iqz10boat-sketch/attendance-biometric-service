@@ -6,6 +6,7 @@ on the public ASGI application. Only the endpoints below are exposed publicly.
 from __future__ import annotations
 
 import asyncio
+import cv2
 import hmac
 import json
 import os
@@ -25,6 +26,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from .liveness_challenges import initialize_liveness_tables, router as liveness_challenge_router
+from .process_lock import watchlist_file_lock
 
 SERVICE_VERSION = "0.1.0"
 DEFAULT_DATA_DIR = Path(os.getenv("BIOMETRIC_DATA_DIR", str(Path.cwd() / ".data")))
@@ -142,6 +144,15 @@ async def lifespan(app: FastAPI):
     if len(_api_key()) < 32:
         raise RuntimeError("BIOMETRIC_API_KEY must be configured with at least 32 characters")
 
+    # Bound native CPU threading because each Uvicorn worker owns an independent model stack.
+    try:
+        opencv_threads = int(os.getenv("BIOMETRIC_OPENCV_THREADS", "1"))
+    except ValueError as exc:
+        raise RuntimeError("BIOMETRIC_OPENCV_THREADS must be a positive integer") from exc
+    if not 1 <= opencv_threads <= 64:
+        raise RuntimeError("BIOMETRIC_OPENCV_THREADS must be between 1 and 64")
+    cv2.setNumThreads(opencv_threads)
+
     # Render's Docker image places the pinned upstream repository here. Import it
     # dynamically so unit tests can exercise the adapter without downloading models.
     upstream_api = os.getenv("OPENBIOMETRICS_API_PATH", "/opt/openbiometrics/api")
@@ -172,9 +183,13 @@ async def lifespan(app: FastAPI):
         # Strict readiness: fail closed if a critical model/component is missing.
         app.state.engine_status = engine_status
         app.state.data_dir = data_dir
-        app.state.registry = _init_registry(data_dir / "registry.sqlite3")
-        initialize_liveness_tables(app.state.registry)
         app.state.engine_lock = asyncio.Lock()
+        app.state.watchlist_fallback_lock = asyncio.Lock()
+        async with watchlist_file_lock(
+            data_dir, shared=False, fallback_lock=app.state.watchlist_fallback_lock
+        ):
+            app.state.registry = _init_registry(data_dir / "registry.sqlite3")
+            initialize_liveness_tables(app.state.registry)
         app.state.liveness_lock = asyncio.Lock()
         app.state.engine_client = client
         app.state.started_at = time.monotonic()
@@ -284,7 +299,11 @@ async def list_collections(request: Request):
 async def create_collection(payload: CollectionCreate, request: Request):
     collection_id = _safe_collection_id(payload.id)
     path = _collection_file(request.app.state.data_dir, collection_id)
-    async with request.app.state.engine_lock:
+    async with request.app.state.engine_lock, watchlist_file_lock(
+        request.app.state.data_dir,
+        shared=False,
+        fallback_lock=_watchlist_fallback_lock(request),
+    ):
         if path.exists():
             raise HTTPException(status_code=409, detail="Collection already exists")
         collection = {"collection": {"id": collection_id, "name": payload.name, "threshold": payload.threshold}}
@@ -310,6 +329,16 @@ async def _read_image(image: UploadFile) -> bytes:
     if len(data) > MAX_IMAGE_BYTES:
         raise HTTPException(status_code=413, detail="Image too large")
     return data
+
+
+def _watchlist_fallback_lock(request: Request) -> asyncio.Lock:
+    """Return the per-app lock used when OS flock is unavailable (e.g. Windows tests)."""
+    lock = getattr(request.app.state, "watchlist_fallback_lock", None)
+    if lock is None:
+        # Assignment is atomic with respect to this event loop: there is no await here.
+        lock = asyncio.Lock()
+        request.app.state.watchlist_fallback_lock = lock
+    return lock
 
 
 def _client(request: Request) -> httpx.AsyncClient:
@@ -350,7 +379,11 @@ async def enroll_person(
         raise HTTPException(status_code=422, detail="The request did not pass validation")
     image_bytes = await _read_image(images)
     client = _client(request)
-    async with request.app.state.engine_lock:
+    async with request.app.state.engine_lock, watchlist_file_lock(
+        request.app.state.data_dir,
+        shared=False,
+        fallback_lock=_watchlist_fallback_lock(request),
+    ):
         existing = request.app.state.registry.execute(
             "SELECT 1 FROM persons WHERE collection_id=? AND person_id=?", (collection_id, person_id)
         ).fetchone()
@@ -429,7 +462,11 @@ async def search_person(
     if not 0.0 < threshold <= 1.0:
         raise HTTPException(status_code=422, detail="Invalid threshold")
     image_bytes = await _read_image(image)
-    async with request.app.state.engine_lock:
+    async with watchlist_file_lock(
+        request.app.state.data_dir,
+        shared=True,
+        fallback_lock=_watchlist_fallback_lock(request),
+    ):
         response = await _client(request).post(
             "/api/v1/identify",
             data={"watchlist_name": collection_id, "top_k": limit, "threshold": threshold},
@@ -505,7 +542,11 @@ async def delete_person(collection_id: str, person_id: str, request: Request):
     if not _read_collection(request.app.state.data_dir, collection_id):
         # Treat a deleted collection as already removed for idempotent cleanup.
         return {"deleted": True, "already_missing": True, "request_id": _request_id(request)}
-    async with request.app.state.engine_lock:
+    async with request.app.state.engine_lock, watchlist_file_lock(
+        request.app.state.data_dir,
+        shared=False,
+        fallback_lock=_watchlist_fallback_lock(request),
+    ):
         response = await _client(request).delete(
             f"/api/v1/watchlist/{person_id}", params={"watchlist_name": collection_id}
         )

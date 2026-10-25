@@ -26,6 +26,7 @@ replace_exactly_once(
     {
         """            ctx_id=-1,  # CPU on Mac, set to 0 for GPU
         ),""": """            ctx_id=-1,
+            det_thresh=0.35,
             enable_demographics=False,
             enable_quality=True,
         ),""",
@@ -52,6 +53,74 @@ site_packages = Path(sysconfig.get_paths()["purelib"])
 engine_package = site_packages / "openbiometrics"
 liveness_path = engine_package / "core" / "liveness.py"
 pipeline_path = engine_package / "core" / "pipeline.py"
+detector_path = engine_package / "core" / "detector.py"
+
+# YuNet's single full-resolution pass is brittle across phone camera outputs and
+# near/far framing. Delegate to the tested multi-scale helper while keeping the
+# aligned recognition crop and every downstream liveness/match check intact.
+replace_exactly_once(
+    detector_path,
+    {
+        '''    def _detect_yunet(self, image: np.ndarray, max_faces: int) -> list[DetectedFace]:
+        """YuNet detection via OpenCV DNN."""
+        h, w = image.shape[:2]
+        self._yunet.setInputSize((w, h))
+        _, raw = self._yunet.detect(image)
+
+        if raw is None:
+            return []
+
+        results = []
+        for det in raw:
+            # YuNet output: [x, y, w, h, right_eye_x, right_eye_y, left_eye_x, left_eye_y,
+            #                 nose_x, nose_y, right_mouth_x, right_mouth_y,
+            #                 left_mouth_x, left_mouth_y, confidence]
+            x, y, bw, bh = det[0:4]
+            confidence = float(det[14])
+
+            bbox = np.array([x, y, x + bw, y + bh], dtype=np.float32)
+
+            # YuNet landmark order: right_eye, left_eye, nose, right_mouth, left_mouth
+            # Our order: left_eye, right_eye, nose, left_mouth, right_mouth
+            landmarks = np.array(
+                [
+                    [det[6], det[7]],   # left_eye
+                    [det[4], det[5]],   # right_eye
+                    [det[8], det[9]],   # nose
+                    [det[12], det[13]], # left_mouth
+                    [det[10], det[11]], # right_mouth
+                ],
+                dtype=np.float32,
+            )
+
+            aligned = _align_face(image, landmarks)
+            results.append(
+                DetectedFace(
+                    bbox=bbox,
+                    landmarks=landmarks,
+                    confidence=confidence,
+                    aligned=aligned,
+                )
+            )
+
+        results.sort(key=lambda f: f.confidence, reverse=True)
+        if max_faces > 0:
+            results = results[:max_faces]
+        return results
+''': '''    def _detect_yunet(self, image: np.ndarray, max_faces: int) -> list[DetectedFace]:
+        """Detect faces at several bounded scales for close-up and distant captures."""
+        from biometric_service.face_detection import detect_yunet_multiscale
+
+        return detect_yunet_multiscale(
+            detector=self._yunet,
+            image=image,
+            max_faces=max_faces,
+            detected_face_cls=DetectedFace,
+            align_face=_align_face,
+        )
+''',
+    },
+)
 
 replace_exactly_once(
     liveness_path,
@@ -174,6 +243,8 @@ replace_exactly_once(
             quality_gate=face_cfg.quality_gate,
         )""": """            enable_quality=face_cfg.enable_quality,
             quality_gate=face_cfg.quality_gate,
+            det_thresh=face_cfg.det_thresh,
+            det_size=face_cfg.det_size,
             detector=face_cfg.detector,
             recognizer=face_cfg.recognizer,
             demographics_model=face_cfg.demographics_model,
@@ -248,3 +319,186 @@ replace_exactly_once(
 )
 
 print("Applied CPU-only API configuration, pinned MiniFASNet preprocessing, and recognizer-compatible FAISS watchlists.")
+
+
+# BIOMETRIC_CAPACITY_PATCH_V1: bounded CPU threading for multi-worker attendance inference.
+# This is applied during the Docker build to the pinned installed OpenBiometrics package.
+import os as _biometric_capacity_os
+
+_session_path = engine_package / "runtime" / "session.py"
+replace_exactly_once(
+    _session_path,
+    {
+        """from pathlib import Path
+
+import numpy as np
+import onnxruntime as ort
+""": """from pathlib import Path
+
+import os as _biometric_capacity_os
+import numpy as np
+import onnxruntime as ort
+""",
+        """        self._session = ort.InferenceSession(self._model_path, providers=self._providers)
+""": """        # BIOMETRIC_CAPACITY_PATCH_V1: tune per-process ONNX CPU usage to avoid worker oversubscription.
+        try:
+            intra_threads = int(_biometric_capacity_os.getenv("BIOMETRIC_ORT_INTRA_THREADS", "1"))
+        except ValueError as exc:
+            raise RuntimeError("BIOMETRIC_ORT_INTRA_THREADS must be a positive integer") from exc
+        if not 1 <= intra_threads <= 64:
+            raise RuntimeError("BIOMETRIC_ORT_INTRA_THREADS must be between 1 and 64")
+        session_options = ort.SessionOptions()
+        session_options.intra_op_num_threads = intra_threads
+        session_options.inter_op_num_threads = 1
+        session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        session_options.add_session_config_entry("session.inter_op.allow_spinning", "0")
+        self._session = ort.InferenceSession(
+            self._model_path,
+            sess_options=session_options,
+            providers=self._providers,
+        )
+"""
+    },
+)
+
+# BIOMETRIC_KERNEL_SYNTAX_GUARD_V2
+# Normalize only known identical duplicates in the single PipelineConfig call.
+# Unexpected multiplicities or values fail closed; no thresholds are changed.
+_kernel_source = kernel_path.read_text(encoding="utf-8")
+_kernel_lines = _kernel_source.splitlines()
+_call_starts = [
+    i for i, line in enumerate(_kernel_lines)
+    if "pipeline_config = PipelineConfig(" in line
+]
+if len(_call_starts) != 1:
+    raise SystemExit(
+        "Expected exactly one PipelineConfig construction in patched kernel.py; "
+        f"found {len(_call_starts)}"
+    )
+_call_start = _call_starts[0]
+_call_end = next(
+    (i for i in range(_call_start + 1, len(_kernel_lines))
+     if _kernel_lines[i].strip() == ")" and len(_kernel_lines[i]) - len(_kernel_lines[i].lstrip()) == 8),
+    None,
+)
+if _call_end is None:
+    raise SystemExit("Could not locate the end of PipelineConfig call in kernel.py")
+
+# These exact assignments were found duplicated during build-time validation.
+# Remove one later copy only when both lines are textually identical.
+for _target in (
+    "det_thresh=face_cfg.det_thresh,",
+    "det_size=face_cfg.det_size,",
+):
+    _target_lines = [
+        i for i in range(_call_start + 1, _call_end)
+        if _kernel_lines[i].strip() == _target
+    ]
+    if len(_target_lines) == 2:
+        _kernel_lines.pop(_target_lines[1])
+        _call_end -= 1
+    elif len(_target_lines) != 1:
+        raise SystemExit(
+            "Unexpected PipelineConfig assignment; refusing to guess: "
+            f"{_target!r} occurred {len(_target_lines)} times"
+        )
+
+_kernel_source = "\n".join(_kernel_lines) + "\n"
+kernel_path.write_text(_kernel_source, encoding="utf-8")
+
+# Compile the actual installed files that will be imported at runtime.
+_validation_paths = [kernel_path, pipeline_config_path, liveness_path, pipeline_path]
+if "_session_path" in globals():
+    _validation_paths.append(_session_path)
+for _patched_path in _validation_paths:
+    try:
+        compile(_patched_path.read_text(encoding="utf-8"), str(_patched_path), "exec")
+    except SyntaxError as _exc:
+        raise SystemExit(
+            f"Patched upstream source failed syntax validation: {_patched_path}: {_exc}"
+        ) from _exc
+
+print("Validated patched upstream kernel, pipeline, liveness and ONNX session syntax.")
+
+# START: patched upstream syntax guard
+def _validate_patched_upstream_sources():
+    import compileall
+    import sysconfig
+    from pathlib import Path
+
+    engine_root = (
+        Path(sysconfig.get_paths()["purelib"]) / "openbiometrics"
+    )
+    kernel_file = engine_root / "kernel.py"
+
+    if not kernel_file.is_file():
+        raise SystemExit(
+            f"Patched kernel not found: {kernel_file}"
+        )
+
+    raw = kernel_file.read_bytes()
+    newline = b"\r\n" if b"\r\n" in raw else b"\n"
+    lines = raw.decode("utf-8").splitlines()
+
+    starts = [
+        i for i, line in enumerate(lines)
+        if "pipeline_config = PipelineConfig(" in line
+    ]
+    if len(starts) != 1:
+        raise SystemExit(
+            "Expected exactly one PipelineConfig constructor; "
+            f"found {len(starts)}"
+        )
+
+    start = starts[0]
+    start_indent = len(lines[start]) - len(lines[start].lstrip())
+
+    ends = [
+        i for i in range(start + 1, len(lines))
+        if lines[i].strip() == ")"
+        and len(lines[i]) - len(lines[i].lstrip()) <= start_indent
+    ]
+    if not ends:
+        raise SystemExit(
+            "Could not locate the end of PipelineConfig constructor"
+        )
+
+    end = ends[0]
+    target = "det_thresh=face_cfg.det_thresh,"
+    positions = [
+        i for i in range(start + 1, end)
+        if lines[i].strip() == target
+    ]
+
+    if len(positions) == 2:
+        del lines[positions[1]]
+        kernel_file.write_bytes(
+            newline.join(line.encode("utf-8") for line in lines)
+            + newline
+        )
+        print("Removed one duplicate kernel det_thresh argument.")
+    elif len(positions) == 1:
+        print("Kernel det_thresh argument is already unique.")
+    else:
+        raise SystemExit(
+            "Expected one or two kernel det_thresh arguments; "
+            f"found {len(positions)}. Refusing to guess."
+        )
+
+    for root in (
+        engine_root,
+        Path("/opt/openbiometrics/api/app"),
+    ):
+        if root.is_dir() and not compileall.compile_dir(
+            str(root), quiet=1, force=True
+        ):
+            raise SystemExit(
+                f"Syntax compilation failed under {root}"
+            )
+
+    print("Patched upstream Python source compiled successfully.")
+
+_validate_patched_upstream_sources()
+# END: patched upstream syntax guard

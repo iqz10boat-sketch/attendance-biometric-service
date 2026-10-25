@@ -56,8 +56,8 @@ PY
 COPY patch_openbiometrics.py /opt/openbiometrics/patch_openbiometrics.py
 COPY scripts/prepare_models.py /opt/openbiometrics/prepare_models.py
 COPY requirements.txt /tmp/adapter-requirements.txt
-RUN pip install --no-cache-dir -r /tmp/adapter-requirements.txt \
-    && pip install --no-cache-dir "/opt/openbiometrics/engine[liveness]" "/opt/openbiometrics/api" \
+RUN pip install --no-cache-dir --timeout 180 --retries 10 -r /tmp/adapter-requirements.txt \
+    && pip install --no-cache-dir --timeout 180 --retries 10 "/opt/openbiometrics/engine[liveness]" "/opt/openbiometrics/api" \
     && python /opt/openbiometrics/patch_openbiometrics.py \
     && python /opt/openbiometrics/prepare_models.py
 
@@ -69,4 +69,4 @@ USER biometric
 
 COPY --chown=biometric:biometric biometric_service /opt/app/biometric_service
 EXPOSE 10000
-CMD ["sh", "-c", "uvicorn biometric_service.main:app --host 0.0.0.0 --port ${PORT:-10000} --no-access-log"]
+CMD ["sh", "-c", "uvicorn biometric_service.main:app --host 0.0.0.0 --port ${PORT:-10000} --workers ${BIOMETRIC_WORKERS:-1} --no-access-log"]
