@@ -43,8 +43,11 @@ Use the `render.yaml` blueprint or create a **Docker Web Service** manually with
 - **Auto deploy:** Off until the initial deployment has passed smoke tests
 - **Secret environment variable:** `BIOMETRIC_API_KEY` set to a newly generated random secret of at least 32 characters
 - `BIOMETRIC_DATA_DIR=/data`
+- `BIOMETRIC_FACE_DETECTION_THRESHOLD=0.60` (valid range: `0.50`–`0.90`)
 
 A Render persistent disk is necessary: without it, redeploys/restarts can erase watchlists and stored identity vectors. This deployment targets one running instance; do not scale horizontally while using a single attached disk and a local SQLite registry.
+
+The face-detection threshold is a precision/recall trade-off. The default `0.60` is higher than YuNet's upstream `0.50` default to suppress weaker detections that can cause false multi-face prompts. It does not ignore credible additional faces or prove accuracy on every camera. Validate with consenting test subjects on the actual device before operational use; a higher threshold can miss genuine faces in poor lighting or at a distance.
 
 The Docker build needs outbound network access to fetch the pinned upstream source and model files. A successful image build is not proof the model loads; verify `/healthz` and authenticated `/v1/health` after deployment.
 

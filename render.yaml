@@ -17,6 +17,8 @@ services:
         sync: false
       - key: BIOMETRIC_DATA_DIR
         value: /data
+      - key: BIOMETRIC_FACE_DETECTION_THRESHOLD
+        value: "0.60"
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: OPENBIOMETRICS_API_PATH

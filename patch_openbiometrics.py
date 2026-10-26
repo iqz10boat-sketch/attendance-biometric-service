@@ -24,11 +24,21 @@ api_main = UPSTREAM_ROOT / "api" / "app" / "main.py"
 replace_exactly_once(
     api_main,
     {
+        "import logging\nimport time": "import logging\nimport os\nimport time",
         """            ctx_id=-1,  # CPU on Mac, set to 0 for GPU
         ),""": """            ctx_id=-1,
+            det_thresh=detection_threshold,
             enable_demographics=False,
             enable_quality=True,
         ),""",
+        """    models_dir = str(Path(__file__).parent.parent.parent / "engine" / "models")
+
+    config = BiometricConfig(""": """    models_dir = str(Path(__file__).parent.parent.parent / "engine" / "models")
+    detection_threshold = float(os.getenv("BIOMETRIC_FACE_DETECTION_THRESHOLD", "0.60"))
+    if not 0.50 <= detection_threshold <= 0.90:
+        raise RuntimeError("BIOMETRIC_FACE_DETECTION_THRESHOLD must be between 0.50 and 0.90")
+
+    config = BiometricConfig(""",
         """        document=DocumentConfig(
             enabled=True,""": """        document=DocumentConfig(
             enabled=False,""",

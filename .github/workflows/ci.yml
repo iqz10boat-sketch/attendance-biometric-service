@@ -24,11 +24,15 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           dockerfile = Path("Dockerfile").read_text()
+          patcher = Path("patch_openbiometrics.py").read_text()
           render = Path("render.yaml").read_text()
           assert "ab09d469327684d630b7383119dd4544253a03c9" in dockerfile
           assert "healthCheckPath: /healthz" in render
           assert "mountPath: /data" in render
           assert "sync: false" in render
+          assert "BIOMETRIC_FACE_DETECTION_THRESHOLD" in patcher
+          assert "det_thresh=detection_threshold" in patcher
+          assert 'key: BIOMETRIC_FACE_DETECTION_THRESHOLD\n        value: "0.60"' in render
           print("PASS: pinned engine, Render health check, persistent disk and secret input")
           PY
 
